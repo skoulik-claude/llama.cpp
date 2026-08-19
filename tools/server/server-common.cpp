@@ -1364,14 +1364,22 @@ json oaicompat_chat_params_parse(
     if (!chat_params.grammar.empty()) {
         llama_params["grammar"]      = chat_params.grammar;
         llama_params["grammar_type"] = std::string("tool_calls");
+
+        // A template-produced grammar owns its own lazy/trigger configuration,
+        // so set them only alongside it. With no template grammar there is
+        // nothing to be lazy about, and setting them unconditionally shadows a
+        // grammar the request body supplied together with its own triggers:
+        // the copy-remaining-properties loop below only fills keys that are
+        // absent, so a client's "grammar_lazy"/"grammar_triggers" were silently
+        // dropped on this endpoint.
+        llama_params["grammar_lazy"] = chat_params.grammar_lazy;
+        auto grammar_triggers        = json::array();
+        for (const auto & trigger : chat_params.grammar_triggers) {
+            server_grammar_trigger ct(trigger);
+            grammar_triggers.push_back(ct.to_json());
+        }
+        llama_params["grammar_triggers"] = grammar_triggers;
     }
-    llama_params["grammar_lazy"] = chat_params.grammar_lazy;
-    auto grammar_triggers        = json::array();
-    for (const auto & trigger : chat_params.grammar_triggers) {
-        server_grammar_trigger ct(trigger);
-        grammar_triggers.push_back(ct.to_json());
-    }
-    llama_params["grammar_triggers"]  = grammar_triggers;
     llama_params["preserved_tokens"]  = chat_params.preserved_tokens;
     llama_params["generation_prompt"] = chat_params.generation_prompt;
     for (const auto & stop : chat_params.additional_stops) {
