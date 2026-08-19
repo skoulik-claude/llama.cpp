@@ -3472,8 +3472,6 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
-                    bool has_mtmd = false;
-
                     // check if we should process the mtmd chunk
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();
@@ -3513,8 +3511,6 @@ private:
                             // the chunk is already in the KV cache at this point, so we don't need to keep its data around
                             slot.prompt.tokens.push_back_placeholder(chunk.get());
                         }
-
-                        has_mtmd = true;
                     }
 
                     const auto & spans = slot.task->params.message_spans;
@@ -3618,8 +3614,8 @@ private:
                         do_checkpoint = false;
                     }
 
-                    // do not checkpoint after mtmd chunks
-                    do_checkpoint = do_checkpoint && !has_mtmd;
+                    // checkpoint after mtmd chunks is allowed. for memory that cannot roll back
+                    // (hybrid/recurrent), this is the only point to resume from without re-encoding the media
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
