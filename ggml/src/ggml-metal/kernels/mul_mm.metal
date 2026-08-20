@@ -494,13 +494,44 @@ kernel void kernel_mul_mm_id(
     constexpr int NL1 = NK/8;
 
     const int im = tgpig.z; // expert
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
     const int32_t neh1 = tpe_u32[im];
+
+    // Same threadgroup swizzle as kernel_mul_mm, for the same reason - see the
+    // comment there. neh1 is uniform for a given expert (tgpig.z), so gating on it
+    // keeps the remap uniform across the (x, y) plane it reorders, and nbx stays
+    // the LAUNCHED x extent (from ne21) so the mapping remains a bijection over the
+    // grid; tiles landing beyond this expert's token count still take the early-out
+    // below, just from different threadgroups than before.
+    //
+    // NOTE: unexercised by the MoE models on hand - an expert FFN has a small ne00,
+    // so per-expert src1 stays far under the threshold. It is reachable for MoEs
+    // with few experts and a large expert FFN at a large ubatch.
+    int sy = tgpig.y;
+    int sx = tgpig.x;
+
+    if ((size_t) neh1 * args.nb11 > (32u << 20)) {
+        const uint tile_bytes = NR0*(uint) args.nb01;
+        const int  SWZ = (int) clamp((10u << 20)/max(tile_bytes, 1u), 1u, 16u);
+
+        const int nbx = (args.ne21 + NR1 - 1)/NR1;
+        const int nby = (args.ne0  + NR0 - 1)/NR0;
+
+        const int lin = (int) tgpig.y*nbx + (int) tgpig.x;
+        const int tpg = SWZ*nbx;
+        const int y0  = (lin/tpg)*SWZ;
+        const int lid = lin%tpg;
+        const int gh  = (nby - y0) < SWZ ? (nby - y0) : SWZ;
+
+        sy = y0 + lid%gh;
+        sx = lid/gh;
+    }
+
+    const int r0 = sy*NR0;
+    const int r1 = sx*NR1;
 
     if (r1 >= neh1) {
         return;
