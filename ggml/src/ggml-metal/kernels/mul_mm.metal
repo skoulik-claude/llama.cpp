@@ -187,7 +187,14 @@ kernel void kernel_mul_mm(
     int sx = tgpig.x;
 
     if ((size_t) args.ne1 * args.nb11 > (32u << 20)) {
-        constexpr int SWZ = 8;
+        // The group size follows the BYTES of a src0 tile rather than a fixed tile
+        // count, because the quantity being bounded is the SWZ*NR0 rows of src0 held
+        // across the group and an f16 tile is ~2x the bytes of a q8_0 one. Measured
+        // on M1 Max at K=17408: q8_0 peaks at 8 (8.29 TFLOPS) and f16 at 4 (7.37),
+        // and using 16 for f16 there costs 29%. Both optima sit at ~9 MB of src0,
+        // which is what this expression targets.
+        const uint tile_bytes = NR0*(uint) args.nb01;
+        const int  SWZ = (int) clamp((10u << 20)/max(tile_bytes, 1u), 1u, 16u);
 
         const int nbx = (args.ne1 + NR1 - 1)/NR1; // src1 (batch) tiles
         const int nby = (args.ne0 + NR0 - 1)/NR0; // src0 (row)   tiles
