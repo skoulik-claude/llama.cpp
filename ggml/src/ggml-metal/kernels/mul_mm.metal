@@ -168,8 +168,42 @@ kernel void kernel_mul_mm(
     constexpr int NL1 = NK/8;
 
     const int im = tgpig.z;
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
+
+    // Threadgroup swizzle.
+    //
+    // The launch order is x-fastest, and x indexes the src1 (batch) tiles while y
+    // indexes the src0 (row) tiles. One row tile therefore streams the WHOLE src1
+    // matrix before the next row tile starts, so the reuse distance for a src0 tile
+    // scales with ne00. Once src1 stops fitting in cache, every src0 tile is
+    // refetched on every step and throughput collapses: measured on an M1 Max
+    // (48 MB SLC) with the FLOP count held constant, mul_mm is flat at ~79% of peak
+    // while src1 <= 34 MB and falls to 46% at 143 MB and 26% at 285 MB.
+    //
+    // Walking the grid in groups of SWZ row tiles instead bounds the working set to
+    // SWZ src0 tiles plus one src1 tile, cutting src1 DRAM traffic by ~SWZ. Only
+    // worth doing once src1 is large; below the threshold we keep the original
+    // mapping so small matrices are unaffected.
+    int sy = tgpig.y;
+    int sx = tgpig.x;
+
+    if ((size_t) args.ne1 * args.nb11 > (32u << 20)) {
+        constexpr int SWZ = 8;
+
+        const int nbx = (args.ne1 + NR1 - 1)/NR1; // src1 (batch) tiles
+        const int nby = (args.ne0 + NR0 - 1)/NR0; // src0 (row)   tiles
+
+        const int lin = (int) tgpig.y*nbx + (int) tgpig.x;
+        const int tpg = SWZ*nbx;
+        const int y0  = (lin/tpg)*SWZ;
+        const int lid = lin%tpg;
+        const int gh  = (nby - y0) < SWZ ? (nby - y0) : SWZ;
+
+        sy = y0 + lid%gh;
+        sx = lid/gh;
+    }
+
+    const int r0 = sy*NR0;
+    const int r1 = sx*NR1;
 
     // if this block is of 64x32 shape or smaller
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
