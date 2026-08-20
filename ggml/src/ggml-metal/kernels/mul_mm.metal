@@ -194,7 +194,14 @@ kernel void kernel_mul_mm(
         // and using 16 for f16 there costs 29%. Both optima sit at ~9 MB of src0,
         // which is what this expression targets.
         const uint tile_bytes = NR0*(uint) args.nb01;
-        const int  SWZ = (int) clamp((10u << 20)/max(tile_bytes, 1u), 1u, 16u);
+        const uint want = clamp((10u << 20)/max(tile_bytes, 1u), 1u, 8u);
+
+        // Round DOWN to a power of two. A group height that does not divide the row
+        // tile count leaves a ragged last group and measurably hurts: on M1 Max at
+        // K=17408 f16, SWZ 8 gives 7.28 TFLOPS but SWZ 9 gives 5.50. Snapping to
+        // powers of two also makes the budget above only need to be right within a
+        // factor of two, which matters because it is calibrated to one chip's cache.
+        const int SWZ = want >= 8 ? 8 : want >= 4 ? 4 : want >= 2 ? 2 : 1;
 
         const int nbx = (args.ne1 + NR1 - 1)/NR1; // src1 (batch) tiles
         const int nby = (args.ne0 + NR0 - 1)/NR0; // src0 (row)   tiles
@@ -515,7 +522,14 @@ kernel void kernel_mul_mm_id(
 
     if ((size_t) neh1 * args.nb11 > (32u << 20)) {
         const uint tile_bytes = NR0*(uint) args.nb01;
-        const int  SWZ = (int) clamp((10u << 20)/max(tile_bytes, 1u), 1u, 16u);
+        const uint want = clamp((10u << 20)/max(tile_bytes, 1u), 1u, 8u);
+
+        // Round DOWN to a power of two. A group height that does not divide the row
+        // tile count leaves a ragged last group and measurably hurts: on M1 Max at
+        // K=17408 f16, SWZ 8 gives 7.28 TFLOPS but SWZ 9 gives 5.50. Snapping to
+        // powers of two also makes the budget above only need to be right within a
+        // factor of two, which matters because it is calibrated to one chip's cache.
+        const int SWZ = want >= 8 ? 8 : want >= 4 ? 4 : want >= 2 ? 2 : 1;
 
         const int nbx = (args.ne21 + NR1 - 1)/NR1;
         const int nby = (args.ne0  + NR0 - 1)/NR0;
