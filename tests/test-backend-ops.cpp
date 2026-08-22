@@ -9974,6 +9974,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
 
+    // Large src1 with more than one row tile. The Metal mul_mm threadgroup swizzle only
+    // engages once src1 exceeds 32 MB, and only permutes when the grid has several row
+    // tiles, so every case above leaves it at the identity. The row tile counts here (10
+    // at NR0=64, and 5) are deliberately not multiples of the group height (8 for a q8_0
+    // tile, 4 for an f16 one), so the ragged last group is covered as well.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 640, 1056,  8192, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 320,  512, 17408, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, 2, false, 128, 1056, 8192));
+
     // K not a multiple of 32
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  65, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  80, {1, 1}, {1, 1}));
