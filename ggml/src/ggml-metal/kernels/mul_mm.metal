@@ -43,9 +43,41 @@ kernel void kernel_mul_mm(
     constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
 
+    int sy = tgpig.y;
+    int sx = tgpig.x;
+
+    // Same threadgroup swizzle as the simdgroup kernel below, for the same reason - see
+    // the comment there. The grid mapping is identical (y indexes src0 row tiles, x
+    // indexes src1 tiles, launched x-fastest), so one row tile still streams the whole
+    // of src1 before the next one starts. This kernel is if anything more exposed: it
+    // does not stage src1 in threadgroup memory but lets the tensor op read it straight
+    // from device memory.
+    //
+    // The tile geometry differs - NRB is 128 here against NR1 = 32 - but the row tile
+    // height NRA is the same 64, so the src0 byte budget below is unchanged and the
+    // group sizes come out the same.
+    if ((size_t) N * args.nb11 > (32u << 20)) {
+        const uint tile_bytes = NRA*(uint) args.nb01;
+        const uint want = clamp((10u << 20)/max(tile_bytes, 1u), 1u, 8u);
+
+        const int SWZ = want >= 8 ? 8 : want >= 4 ? 4 : want >= 2 ? 2 : 1;
+
+        const int nbx = (N + NRB - 1)/NRB; // src1 (batch) tiles
+        const int nby = (M + NRA - 1)/NRA; // src0 (row)   tiles
+
+        const int lin = (int) tgpig.y*nbx + (int) tgpig.x;
+        const int tpg = SWZ*nbx;
+        const int y0  = (lin/tpg)*SWZ;
+        const int lid = lin%tpg;
+        const int gh  = (nby - y0) < SWZ ? (nby - y0) : SWZ;
+
+        sy = y0 + lid%gh;
+        sx = lid/gh;
+    }
+
     // Tile offsets in output matrix
-    const int ra = tgpig.y * NRA;
-    const int rb = tgpig.x * NRB;
+    const int ra = sy * NRA;
+    const int rb = sx * NRB;
 
     // Threadgroup memory for dequantized A tile only
     threadgroup SA * sa = (threadgroup SA *)(shmem);
