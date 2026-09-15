@@ -2056,8 +2056,6 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    GGML_UNUSED(flags);
-
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2078,7 +2076,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
 
             // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
+            // only a partial state (a checkpoint) may drop masked cells: a full state can be
+            // restored and then truncated to a prefix - the server's prompt cache does exactly
+            // that - and the prefix's own window needs cells that are masked relative to the
+            // sequence's current end. Dropping them there silently corrupts the restored window
+            // whenever the SWA cache holds them (--swa-full)
+            if (add_cell && seq_id != -1 && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                 const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
