@@ -8,6 +8,52 @@ constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 
+// Threadgroup swizzle: which tile a threadgroup of a tiled mul_mm kernel processes.
+//
+// The launch order is x-fastest, and x indexes the src1 (batch) tiles while y indexes the src0
+// (row) tiles. One row tile therefore streams the WHOLE src1 matrix before the next row tile
+// starts, so the reuse distance for a src0 tile scales with ne00. Once src1 stops fitting in
+// cache, every src0 tile is refetched on every step and throughput collapses: measured on an
+// M1 Max (48 MB SLC) with the FLOP count held constant, mul_mm is flat at ~79% of peak while
+// src1 <= 34 MB and falls to 46% at 143 MB and 26% at 285 MB.
+//
+// Walking the grid in groups of SWZ row tiles instead bounds the working set to SWZ src0 tiles
+// plus one src1 tile, cutting src1 DRAM traffic by ~SWZ. Only worth doing once src1 is large;
+// below the threshold the original mapping is kept, so small matrices are unaffected.
+//
+//   src1_bytes       bytes of src1 one row tile streams (src1 rows * nb11) - the gate
+//   src0_tile_bytes  bytes of one src0 row tile (tile height * nb01) - sizes the group
+//   nbx, nby         the LAUNCHED grid extent: src1 (batch) tiles in x, src0 (row) tiles in y
+//
+// Returns (x, y) of the tile to process; a bijection over the nbx*nby grid.
+static inline int2 mul_mm_swizzle(uint3 tgpig, size_t src1_bytes, uint src0_tile_bytes, int nbx, int nby) {
+    if (src1_bytes <= (32u << 20)) {
+        return int2(tgpig.x, tgpig.y);
+    }
+
+    // The group size follows the BYTES of a src0 tile rather than a fixed tile count, because
+    // the quantity being bounded is the SWZ tiles of src0 held across the group and an f16 tile
+    // is ~2x the bytes of a q8_0 one. Measured on M1 Max at K=17408: q8_0 peaks at 8 (8.29
+    // TFLOPS) and f16 at 4 (7.37), and using 16 for f16 there costs 29%. Both optima sit at
+    // ~9 MB of src0, which is what this expression targets.
+    const uint want = clamp((10u << 20)/max(src0_tile_bytes, 1u), 1u, 8u);
+
+    // Round DOWN to a power of two. A group height that does not divide the row tile count
+    // leaves a ragged last group and measurably hurts: on M1 Max at K=17408 f16, SWZ 8 gives
+    // 7.28 TFLOPS but SWZ 9 gives 5.50. Snapping to powers of two also makes the budget above
+    // only need to be right within a factor of two, which matters because it is calibrated to
+    // one chip's cache.
+    const int SWZ = want >= 8 ? 8 : want >= 4 ? 4 : want >= 2 ? 2 : 1;
+
+    const int lin = (int) tgpig.y*nbx + (int) tgpig.x;
+    const int tpg = SWZ*nbx;
+    const int y0  = (lin/tpg)*SWZ;
+    const int lid = lin%tpg;
+    const int gh  = (nby - y0) < SWZ ? (nby - y0) : SWZ;
+
+    return int2(lid/gh, y0 + lid%gh);
+}
+
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
 template<
@@ -43,41 +89,16 @@ kernel void kernel_mul_mm(
     constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
 
-    int sy = tgpig.y;
-    int sx = tgpig.x;
-
-    // Same threadgroup swizzle as the simdgroup kernel below, for the same reason - see
-    // the comment there. The grid mapping is identical (y indexes src0 row tiles, x
-    // indexes src1 tiles, launched x-fastest), so one row tile still streams the whole
-    // of src1 before the next one starts. This kernel is if anything more exposed: it
-    // does not stage src1 in threadgroup memory but lets the tensor op read it straight
-    // from device memory.
-    //
-    // The tile geometry differs - NRB is 128 here against NR1 = 32 - but the row tile
-    // height NRA is the same 64, so the src0 byte budget below is unchanged and the
-    // group sizes come out the same.
-    if ((size_t) N * args.nb11 > (32u << 20)) {
-        const uint tile_bytes = NRA*(uint) args.nb01;
-        const uint want = clamp((10u << 20)/max(tile_bytes, 1u), 1u, 8u);
-
-        const int SWZ = want >= 8 ? 8 : want >= 4 ? 4 : want >= 2 ? 2 : 1;
-
-        const int nbx = (N + NRB - 1)/NRB; // src1 (batch) tiles
-        const int nby = (M + NRA - 1)/NRA; // src0 (row)   tiles
-
-        const int lin = (int) tgpig.y*nbx + (int) tgpig.x;
-        const int tpg = SWZ*nbx;
-        const int y0  = (lin/tpg)*SWZ;
-        const int lid = lin%tpg;
-        const int gh  = (nby - y0) < SWZ ? (nby - y0) : SWZ;
-
-        sy = y0 + lid%gh;
-        sx = lid/gh;
-    }
+    // Threadgroup swizzle (mul_mm_swizzle). This kernel is if anything more exposed than the
+    // simdgroup one: it does not stage src1 in threadgroup memory but lets the tensor op read it
+    // straight from device memory. The tile geometry differs - NRB is 128 here against NR1 = 32
+    // - but the row tile height NRA is the same 64, so the group sizes come out the same.
+    const int2 tile = mul_mm_swizzle(tgpig, (size_t) N*args.nb11, NRA*(uint) args.nb01,
+            (N + NRB - 1)/NRB, (M + NRA - 1)/NRA);
 
     // Tile offsets in output matrix
-    const int ra = sy * NRA;
-    const int rb = sx * NRB;
+    const int ra = tile.y * NRA;
+    const int rb = tile.x * NRB;
 
     // Threadgroup memory for dequantized A tile only
     threadgroup SA * sa = (threadgroup SA *)(shmem);
@@ -201,55 +222,12 @@ kernel void kernel_mul_mm(
 
     const int im = tgpig.z;
 
-    // Threadgroup swizzle.
-    //
-    // The launch order is x-fastest, and x indexes the src1 (batch) tiles while y
-    // indexes the src0 (row) tiles. One row tile therefore streams the WHOLE src1
-    // matrix before the next row tile starts, so the reuse distance for a src0 tile
-    // scales with ne00. Once src1 stops fitting in cache, every src0 tile is
-    // refetched on every step and throughput collapses: measured on an M1 Max
-    // (48 MB SLC) with the FLOP count held constant, mul_mm is flat at ~79% of peak
-    // while src1 <= 34 MB and falls to 46% at 143 MB and 26% at 285 MB.
-    //
-    // Walking the grid in groups of SWZ row tiles instead bounds the working set to
-    // SWZ src0 tiles plus one src1 tile, cutting src1 DRAM traffic by ~SWZ. Only
-    // worth doing once src1 is large; below the threshold we keep the original
-    // mapping so small matrices are unaffected.
-    int sy = tgpig.y;
-    int sx = tgpig.x;
+    // Threadgroup swizzle (mul_mm_swizzle).
+    const int2 tile = mul_mm_swizzle(tgpig, (size_t) args.ne1*args.nb11, NR0*(uint) args.nb01,
+            (args.ne1 + NR1 - 1)/NR1, (args.ne0 + NR0 - 1)/NR0);
 
-    if ((size_t) args.ne1 * args.nb11 > (32u << 20)) {
-        // The group size follows the BYTES of a src0 tile rather than a fixed tile
-        // count, because the quantity being bounded is the SWZ*NR0 rows of src0 held
-        // across the group and an f16 tile is ~2x the bytes of a q8_0 one. Measured
-        // on M1 Max at K=17408: q8_0 peaks at 8 (8.29 TFLOPS) and f16 at 4 (7.37),
-        // and using 16 for f16 there costs 29%. Both optima sit at ~9 MB of src0,
-        // which is what this expression targets.
-        const uint tile_bytes = NR0*(uint) args.nb01;
-        const uint want = clamp((10u << 20)/max(tile_bytes, 1u), 1u, 8u);
-
-        // Round DOWN to a power of two. A group height that does not divide the row
-        // tile count leaves a ragged last group and measurably hurts: on M1 Max at
-        // K=17408 f16, SWZ 8 gives 7.28 TFLOPS but SWZ 9 gives 5.50. Snapping to
-        // powers of two also makes the budget above only need to be right within a
-        // factor of two, which matters because it is calibrated to one chip's cache.
-        const int SWZ = want >= 8 ? 8 : want >= 4 ? 4 : want >= 2 ? 2 : 1;
-
-        const int nbx = (args.ne1 + NR1 - 1)/NR1; // src1 (batch) tiles
-        const int nby = (args.ne0 + NR0 - 1)/NR0; // src0 (row)   tiles
-
-        const int lin = (int) tgpig.y*nbx + (int) tgpig.x;
-        const int tpg = SWZ*nbx;
-        const int y0  = (lin/tpg)*SWZ;
-        const int lid = lin%tpg;
-        const int gh  = (nby - y0) < SWZ ? (nby - y0) : SWZ;
-
-        sy = y0 + lid%gh;
-        sx = lid/gh;
-    }
-
-    const int r0 = sy*NR0;
-    const int r1 = sx*NR1;
+    const int r0 = tile.y*NR0;
+    const int r1 = tile.x*NR1;
 
     // if this block is of 64x32 shape or smaller
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
@@ -539,45 +517,20 @@ kernel void kernel_mul_mm_id(
 
     const int32_t neh1 = tpe_u32[im];
 
-    // Same threadgroup swizzle as kernel_mul_mm, for the same reason - see the
-    // comment there. neh1 is uniform for a given expert (tgpig.z), so gating on it
-    // keeps the remap uniform across the (x, y) plane it reorders, and nbx stays
-    // the LAUNCHED x extent (from ne21) so the mapping remains a bijection over the
-    // grid; tiles landing beyond this expert's token count still take the early-out
-    // below, just from different threadgroups than before.
+    // Threadgroup swizzle (mul_mm_swizzle). neh1 is uniform for a given expert (tgpig.z), so
+    // gating on it keeps the remap uniform across the (x, y) plane it reorders, and nbx stays the
+    // LAUNCHED x extent (from ne21) so the mapping remains a bijection over the grid; tiles
+    // landing beyond this expert's token count still take the early-out below, just from
+    // different threadgroups than before.
     //
-    // NOTE: unexercised by the MoE models on hand - an expert FFN has a small ne00,
-    // so per-expert src1 stays far under the threshold. It is reachable for MoEs
-    // with few experts and a large expert FFN at a large ubatch.
-    int sy = tgpig.y;
-    int sx = tgpig.x;
+    // NOTE: unexercised by the MoE models on hand - an expert FFN has a small ne00, so per-expert
+    // src1 stays far under the threshold. It is reachable for MoEs with few experts and a large
+    // expert FFN at a large ubatch.
+    const int2 tile = mul_mm_swizzle(tgpig, (size_t) neh1*args.nb11, NR0*(uint) args.nb01,
+            (args.ne21 + NR1 - 1)/NR1, (args.ne0 + NR0 - 1)/NR0);
 
-    if ((size_t) neh1 * args.nb11 > (32u << 20)) {
-        const uint tile_bytes = NR0*(uint) args.nb01;
-        const uint want = clamp((10u << 20)/max(tile_bytes, 1u), 1u, 8u);
-
-        // Round DOWN to a power of two. A group height that does not divide the row
-        // tile count leaves a ragged last group and measurably hurts: on M1 Max at
-        // K=17408 f16, SWZ 8 gives 7.28 TFLOPS but SWZ 9 gives 5.50. Snapping to
-        // powers of two also makes the budget above only need to be right within a
-        // factor of two, which matters because it is calibrated to one chip's cache.
-        const int SWZ = want >= 8 ? 8 : want >= 4 ? 4 : want >= 2 ? 2 : 1;
-
-        const int nbx = (args.ne21 + NR1 - 1)/NR1;
-        const int nby = (args.ne0  + NR0 - 1)/NR0;
-
-        const int lin = (int) tgpig.y*nbx + (int) tgpig.x;
-        const int tpg = SWZ*nbx;
-        const int y0  = (lin/tpg)*SWZ;
-        const int lid = lin%tpg;
-        const int gh  = (nby - y0) < SWZ ? (nby - y0) : SWZ;
-
-        sy = y0 + lid%gh;
-        sx = lid/gh;
-    }
-
-    const int r0 = sy*NR0;
-    const int r1 = sx*NR1;
+    const int r0 = tile.y*NR0;
+    const int r1 = tile.x*NR1;
 
     if (r1 >= neh1) {
         return;
