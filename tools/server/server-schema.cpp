@@ -416,6 +416,23 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_json("reasoning_stop_words"))
+        ->set_desc("Strings counted inside the reasoning block where they open a line; the reasoning ends at occurrence reasoning_stop_count")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            ctx.params.sampling.reasoning_stop_seqs.clear();
+            for (const auto & w : data.at("reasoning_stop_words")) {
+                std::string word = w.get<std::string>();
+                if (!word.empty()) {
+                    ctx.params.sampling.reasoning_stop_seqs.push_back(common_tokenize(ctx.vocab, word, false, true));
+                }
+            }
+        }));
+
+    add((new field_num("reasoning_stop_count", params.sampling.reasoning_stop_count))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("End the reasoning at this occurrence of a reasoning_stop_words entry (0 = disabled)"));
+
     add((new field_str("reasoning_budget_message"))
         ->set_desc("Message to prepend to the reasoning budget end tag when forcing it")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
@@ -560,11 +577,13 @@ task_params eval_llama_cmpl_schema(
     // debugging
     {
         auto budget = params.sampling.reasoning_budget_tokens;
-        SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu seqs, forced=%zu toks\n",
+        SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu seqs, forced=%zu toks, stop=%zu seqs at %d\n",
                 budget, params.sampling.generation_prompt.c_str(),
                 params.sampling.reasoning_budget_start.size(),
                 params.sampling.reasoning_budget_end.size(),
-                params.sampling.reasoning_budget_forced.size());
+                params.sampling.reasoning_budget_forced.size(),
+                params.sampling.reasoning_stop_seqs.size(),
+                params.sampling.reasoning_stop_count);
     }
 
     return params;

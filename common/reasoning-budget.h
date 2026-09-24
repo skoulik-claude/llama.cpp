@@ -20,7 +20,8 @@ enum common_reasoning_budget_state {
 //
 // State machine: IDLE -> COUNTING -> WAITING_UTF8 -> FORCING -> DONE
 //   IDLE:         passthrough, watching for a start sequence
-//   COUNTING:     counting down remaining tokens, watching for a natural end sequence
+//   COUNTING:     counting down remaining tokens, watching for a natural end sequence,
+//                 and counting stop sequences that open a line
 //   WAITING_UTF8: budget exhausted, allowing tokens to complete a UTF-8 sequence
 //   FORCING:      forces forced_tokens token-by-token (all other logits -> -inf)
 //   DONE:         passthrough forever
@@ -32,6 +33,11 @@ enum common_reasoning_budget_state {
 //   forced_tokens  - token sequence forced when budget expires
 //   budget         - max tokens allowed in the reasoning block
 //   initial_state  - initial state
+//   stop_seqs      - token sequences counted while COUNTING, only where they open a line:
+//                    as the first token of the reasoning block, or after a token ending
+//                    with a newline (without a vocab every occurrence counts)
+//   stop_count     - force the end at this occurrence of a stop sequence, as if the budget
+//                    expired right after it; 0 = never
 //
 struct llama_sampler * common_reasoning_budget_init(
         const struct llama_vocab        * vocab,
@@ -39,7 +45,9 @@ struct llama_sampler * common_reasoning_budget_init(
         const std::vector<llama_tokens> & end_seqs,
         const llama_tokens              & forced_tokens,
         int32_t                           budget,
-        common_reasoning_budget_state     initial_state = REASONING_BUDGET_IDLE);
+        common_reasoning_budget_state     initial_state = REASONING_BUDGET_IDLE,
+        const std::vector<llama_tokens> & stop_seqs     = {},
+        int32_t                           stop_count    = 0);
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
 

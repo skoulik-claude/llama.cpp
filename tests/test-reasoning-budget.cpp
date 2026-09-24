@@ -8,8 +8,10 @@
 #undef NDEBUG
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -26,7 +28,9 @@ static void test_reasoning_budget(
     int32_t budget,
     common_reasoning_budget_state initial_state,
     size_t expected_force_start,   // token index where forcing should start (SIZE_MAX = never)
-    size_t expected_force_end      // token index where forcing should end (after this, no more forcing)
+    size_t expected_force_end,     // token index where forcing should end (after this, no more forcing)
+    const std::vector<llama_tokens> & stop_seqs = {},
+    int32_t stop_count = 0
 ) {
     // Find the maximum token ID to ensure our vocab covers all tokens
     llama_token max_token = 0;
@@ -38,6 +42,9 @@ static void test_reasoning_budget(
         for (auto t : seq) max_token = std::max(max_token, t);
     }
     for (auto t : forced_tokens) max_token = std::max(max_token, t);
+    for (const auto & seq : stop_seqs) {
+        for (auto t : seq) max_token = std::max(max_token, t);
+    }
 
     // Create a minimal sampler with mock vocabulary
     // For this test, we use nullptr as vocab since we're testing state transitions
@@ -48,7 +55,9 @@ static void test_reasoning_budget(
         end_seqs,
         forced_tokens,
         budget,
-        initial_state
+        initial_state,
+        stop_seqs,
+        stop_count
     );
 
     // Create a test token data array for checking forcing behavior
@@ -333,6 +342,97 @@ static void test_reasoning_budget_end_match() {
     fprintf(stderr, "  Test 'matched end sequence' passed\n");
 }
 
+static void test_reasoning_stop_clone_and_reset() {
+    const std::vector<llama_tokens> start = {{100}};
+    const std::vector<llama_tokens> end   = {{101}};
+    const std::vector<llama_tokens> stop  = {{60}};
+    const llama_tokens forced = {102, 101};
+
+    auto * sampler = common_reasoning_budget_init(nullptr, start, end, forced, 100, REASONING_BUDGET_IDLE, stop, 2);
+
+    llama_sampler_accept(sampler, 100); // COUNTING
+    llama_sampler_accept(sampler, 60);  // 1st stop sequence
+
+    // a clone mid-count keeps the count
+    auto * clone = llama_sampler_clone(sampler);
+    llama_sampler_accept(clone, 60);    // 2nd, on the clone
+    GGML_ASSERT(common_reasoning_budget_get_state(clone) == REASONING_BUDGET_FORCING && "cloned counting state lost the stop count");
+    GGML_ASSERT(get_forced_token(clone, 102) == 102);
+
+    // the original counts on its own
+    llama_sampler_accept(sampler, 50);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+    llama_sampler_accept(sampler, 60);  // 2nd, on the original
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
+
+    // reset() clears the count
+    llama_sampler_reset(sampler);
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 60);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING && "reset() must clear the stop count");
+
+    llama_sampler_free(clone);
+    llama_sampler_free(sampler);
+
+    fprintf(stderr, "  Test 'stop count clone and reset' passed\n");
+}
+
+// The line-start rule needs text, so it is tested on a real vocabulary: a stop word counts
+// only as the first token of the reasoning or right after a token ending with a newline.
+static void test_reasoning_stop_line_start(const char * vocab_path) {
+    llama_model_params mparams = llama_model_default_params();
+    mparams.vocab_only = true;
+    llama_model * model = llama_model_load_from_file(vocab_path, mparams);
+    GGML_ASSERT(model != nullptr && "failed to load the vocabulary");
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    const llama_tokens start = common_tokenize(vocab, "<|channel>thought", false, true);
+    const llama_tokens end   = common_tokenize(vocab, "<channel|>", false, true);
+    const llama_tokens stop  = common_tokenize(vocab, "Wait", false, true);
+
+    // the mid-line case must actually contain the stop sequence, or it proves nothing
+    const std::string mid_line = "It says NoWait here.";
+    const llama_tokens mid_line_tokens = common_tokenize(vocab, mid_line, false, true);
+    GGML_ASSERT(std::search(mid_line_tokens.begin(), mid_line_tokens.end(), stop.begin(), stop.end()) != mid_line_tokens.end());
+
+    // the reasoning text accepted until the sampler starts forcing, or "" if it never does
+    const auto cut = [&](const std::string & thinking, int32_t count) {
+        auto * sampler = common_reasoning_budget_init(vocab, {start}, {end}, end, INT32_MAX, REASONING_BUDGET_IDLE, {stop}, count);
+        for (const auto t : start) {
+            llama_sampler_accept(sampler, t);
+        }
+        std::string text;
+        bool forcing = false;
+        for (const auto t : common_tokenize(vocab, thinking, false, true)) {
+            llama_sampler_accept(sampler, t);
+            text += common_token_to_piece(vocab, t, false);
+            if (common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING) {
+                forcing = true;
+                break;
+            }
+        }
+        llama_sampler_free(sampler);
+        return forcing ? text : std::string();
+    };
+
+    const std::string thinking = "\nThe account is 123.\nWait, NoWait is one word.\n\nWait, check it.\nWait.";
+
+    GGML_ASSERT(cut(thinking, 1) == "\nThe account is 123.\nWait");
+    GGML_ASSERT(cut(thinking, 2) == "\nThe account is 123.\nWait, NoWait is one word.\n\nWait");
+    GGML_ASSERT(cut(thinking, 3) == thinking.substr(0, thinking.size() - 1));
+    GGML_ASSERT(cut(thinking, 4).empty());
+
+    // the first token of the reasoning opens a line
+    GGML_ASSERT(cut("Wait, first.", 1) == "Wait");
+
+    // mid-line occurrences never count
+    GGML_ASSERT(cut(mid_line, 1).empty());
+
+    llama_model_free(model);
+
+    fprintf(stderr, "  Test 'stop words open a line' passed\n");
+}
+
 // UTF-8 boundary detection unit test
 // Tests common_utf8_is_complete() from reasoning-budget.h
 static void test_utf8_boundary_detection() {
@@ -358,7 +458,7 @@ static void test_utf8_boundary_detection() {
     GGML_ASSERT(common_utf8_is_complete(std::string("hello\xC3\xA9", 7)));    // ASCII + complete 2-byte
 }
 
-int main(void) {
+int main(int argc, char ** argv) {
     // Reasoning budget sampler tests
     printf("Testing reasoning budget sampler... ");
 
@@ -490,12 +590,132 @@ int main(void) {
             SIZE_MAX, SIZE_MAX); // no forcing expected (natural end)
     }
 
+    // Test 9: Stop sequence count reached before the budget
+    // Flow: i=0 accept(100)->COUNTING; i=2 accept(60)->1st; i=4 accept(60)->2nd->FORCING;
+    //       i=5..6 apply() forces the end sequence
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 50, 60, 51, 60, 52, 53};
+
+        test_reasoning_budget("stop count reached", sequence, start, end, forced,
+            100,    // budget far away
+            REASONING_BUDGET_IDLE,
+            5,      // forcing starts at i=5 (accept at i=4 counts the 2nd stop sequence)
+            6,
+            {{60}}, 2);
+    }
+
+    // Test 10: One stop sequence short of the count - no forcing
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 50, 60, 51, 60, 52, 53};
+
+        test_reasoning_budget("stop count not reached", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            SIZE_MAX, SIZE_MAX,
+            {{60}}, 3);
+    }
+
+    // Test 11: Multi-token stop sequence - a broken sequence does not count
+    // Flow: i=1..3 {60, 50, 61} no match; i=4..5 1st; i=6..7 2nd->FORCING; i=8..9 forced
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 60, 50, 61, 60, 61, 60, 61, 52, 53};
+
+        test_reasoning_budget("multi-token stop sequence", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            8,
+            9,
+            {{60, 61}}, 2);
+    }
+
+    // Test 12: Stop sequences outside the reasoning block are not counted
+    // Flow: i=0..1 before the start tag (IDLE); i=4 the only one inside; i=5 natural end;
+    //       i=6..7 after it (DONE)
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {60, 60, 100, 50, 60, 101, 60, 60, 52};
+
+        test_reasoning_budget("stop outside reasoning not counted", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            SIZE_MAX, SIZE_MAX,
+            {{60}}, 2);
+    }
+
+    // Test 13: The count restarts when a new start tag re-arms the sampler
+    // Flow: 1st block counts one (i=1) and ends (i=2); re-arm at i=3; i=4 1st, i=6 2nd->FORCING
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 60, 101, 100, 60, 52, 60, 53, 54};
+
+        test_reasoning_budget("stop count resets on re-arm", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            7,      // a carried-over count would force at i=5
+            8,
+            {{60}}, 2);
+    }
+
+    // Test 14: A shorter budget still ends the reasoning first
+    // Flow: i=0 accept(100)->COUNTING rem=2; i=1 accept(60)->1st, rem=1; i=2 accept(50)->rem=0->FORCING
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 60, 50, 60, 60, 52};
+
+        test_reasoning_budget("budget before stop count", sequence, start, end, forced,
+            2,
+            REASONING_BUDGET_IDLE,
+            3,
+            4,
+            {{60}}, 3);
+    }
+
+    // Test 15: A stop count of 0 disables stop sequences
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 60, 60, 60, 52};
+
+        test_reasoning_budget("stop count 0 disabled", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            SIZE_MAX, SIZE_MAX,
+            {{60}}, 0);
+    }
+
     test_reasoning_budget_clone_mid_counting();
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();
     test_reasoning_budget_end_match();
+    test_reasoning_stop_clone_and_reset();
 
-    printf("OK (12 tests passed)\n");
+    printf("OK (20 tests passed)\n");
+
+    if (argc > 1) {
+        printf("Testing reasoning stop words on a real vocabulary... ");
+        llama_backend_init();
+        test_reasoning_stop_line_start(argv[1]);
+        llama_backend_free();
+        printf("OK\n");
+    } else {
+        printf("Skipping the real-vocabulary stop word test (no vocabulary path given)\n");
+    }
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();
