@@ -74,18 +74,59 @@ struct common_reasoning_budget_ctx {
     int32_t          stop_seen;    // occurrences counted in this reasoning block
     bool             line_open;    // whether the next token opens a line
     std::deque<bool> opened_line;  // whether each of the last stop_max_len tokens opened a line
+
+    // for ending the reasoning when it loops
+    int32_t                 loop_window; // the least repetition that fires, in tokens; 0 = never
+    size_t                  loop_period; // the longest unit tested, in tokens
+    std::deque<llama_token> loop_hist;   // the last loop_period tokens of this reasoning block
+    std::vector<int32_t>    loop_run;    // loop_run[p]: consecutive tokens equal to the token p before
 };
 
 static bool common_reasoning_budget_stops(const common_reasoning_budget_ctx * ctx) {
     return ctx->stop_count > 0 && !ctx->stop_matcher.seqs.empty();
 }
 
-// start counting stop sequences afresh: the first token of a reasoning block opens a line
-static void common_reasoning_budget_stop_reset(common_reasoning_budget_ctx * ctx) {
+static bool common_reasoning_budget_loops(const common_reasoning_budget_ctx * ctx) {
+    return ctx->loop_period > 0;
+}
+
+// start a reasoning block afresh: no stop sequence counted, the first token opens a line,
+// and no token history for the loop check
+static void common_reasoning_budget_block_reset(common_reasoning_budget_ctx * ctx) {
     ctx->stop_matcher.reset();
     ctx->stop_seen = 0;
     ctx->line_open = true;
     ctx->opened_line.clear();
+    ctx->loop_hist.clear();
+    std::fill(ctx->loop_run.begin(), ctx->loop_run.end(), 0);
+}
+
+// Whether the reasoning now ends in a loop: its tail is one unit of p tokens repeated, for some
+// p up to loop_period, over at least loop_window tokens and at least four whole units. For each
+// p, loop_run[p] counts the consecutive tokens equal to the one p before, and the last
+// loop_run[p] + p tokens are then p-periodic.
+static bool common_reasoning_budget_loop_advance(common_reasoning_budget_ctx * ctx, llama_token token) {
+    int32_t period = 0;
+    for (size_t p = 1; p <= ctx->loop_period; p++) {
+        if (ctx->loop_hist.size() >= p && ctx->loop_hist[ctx->loop_hist.size() - p] == token) {
+            ctx->loop_run[p]++;
+            if (period == 0 && ctx->loop_run[p] + (int32_t) p >= std::max(ctx->loop_window, 4 * (int32_t) p)) {
+                period = (int32_t) p;
+            }
+        } else {
+            ctx->loop_run[p] = 0;
+        }
+    }
+
+    ctx->loop_hist.push_back(token);
+    if (ctx->loop_hist.size() > ctx->loop_period) {
+        ctx->loop_hist.pop_front();
+    }
+
+    if (period > 0) {
+        COM_TRC("loop of a %d-token unit\n", period);
+    }
+    return period > 0;
 }
 
 // Count a stop sequence ending at this token if its first token opened a line: it is the
@@ -128,7 +169,7 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
             if (ctx->start_matcher.advance(token) >= 0) {
                 ctx->state = REASONING_BUDGET_COUNTING;
                 ctx->remaining = ctx->budget;
-                common_reasoning_budget_stop_reset(ctx);
+                common_reasoning_budget_block_reset(ctx);
                 COM_TRC("activated, budget=%d tokens\n", ctx->budget);
 
                 if (ctx->remaining <= 0) {
@@ -174,6 +215,14 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
                     break;
                 }
 
+                if (common_reasoning_budget_loops(ctx) && common_reasoning_budget_loop_advance(ctx, token)) {
+                    ctx->state = utf8_complete ? REASONING_BUDGET_FORCING : REASONING_BUDGET_WAITING_UTF8;
+                    ctx->force_pos = 0;
+                    ctx->end_matcher.reset();
+                    COM_TRC("%s", "loop detected, forcing end sequence\n");
+                    break;
+                }
+
                 ctx->remaining--;
                 if (ctx->remaining <= 0) {
                     if (utf8_complete) {
@@ -210,7 +259,7 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
                 ctx->remaining = ctx->budget;
                 ctx->end_matcher.reset();
                 ctx->end_match = -1;
-                common_reasoning_budget_stop_reset(ctx);
+                common_reasoning_budget_block_reset(ctx);
                 COM_TRC("re-activated on new start tag, budget=%d tokens\n", ctx->budget);
 
                 if (ctx->remaining <= 0) {
@@ -253,14 +302,15 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
     ctx->end_matcher.reset();
     ctx->force_pos = 0;
     ctx->end_match = -1;
-    common_reasoning_budget_stop_reset(ctx);
+    common_reasoning_budget_block_reset(ctx);
 }
 
 static struct llama_sampler * common_reasoning_budget_init_state(
         const struct llama_vocab * vocab, const std::vector<llama_tokens> & start_seqs,
         const std::vector<llama_tokens> & end_seqs, const llama_tokens & forced_tokens,
         int32_t budget, common_reasoning_budget_state initial_state,
-        const std::vector<llama_tokens> & stop_seqs, int32_t stop_count);
+        const std::vector<llama_tokens> & stop_seqs, int32_t stop_count, int32_t loop_window,
+        int32_t loop_max_unit);
 
 static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl);
 
@@ -300,7 +350,9 @@ static struct llama_sampler * common_reasoning_budget_init_state(
         int32_t                           budget,
         common_reasoning_budget_state     initial_state,
         const std::vector<llama_tokens> & stop_seqs,
-        int32_t                           stop_count) {
+        int32_t                           stop_count,
+        int32_t                           loop_window,
+        int32_t                           loop_max_unit) {
     // promote COUNTING with budget <= 0 to FORCING
     if (initial_state == REASONING_BUDGET_COUNTING && budget <= 0) {
         initial_state = REASONING_BUDGET_FORCING;
@@ -311,6 +363,11 @@ static struct llama_sampler * common_reasoning_budget_init_state(
     for (const auto & seq : stop_matcher.seqs) {
         stop_max_len = std::max(stop_max_len, seq.size());
     }
+
+    // the longest unit defaults to a quarter of the window, four repeats filling it; a window
+    // below 4 then tests nothing
+    const size_t loop_period = loop_window <= 0 ? 0
+        : loop_max_unit > 0 ? (size_t) loop_max_unit : (size_t) loop_window / 4;
 
     return llama_sampler_init(
         /* .iface = */ &common_reasoning_budget_i,
@@ -330,6 +387,10 @@ static struct llama_sampler * common_reasoning_budget_init_state(
             /* .stop_seen     = */ 0,
             /* .line_open     = */ true,
             /* .opened_line   = */ {},
+            /* .loop_window   = */ std::max(loop_window, 0),
+            /* .loop_period   = */ loop_period,
+            /* .loop_hist     = */ {},
+            /* .loop_run      = */ std::vector<int32_t>(loop_period + 1, 0),
         }
     );
 }
@@ -342,8 +403,10 @@ struct llama_sampler * common_reasoning_budget_init(
         int32_t                           budget,
         common_reasoning_budget_state     initial_state,
         const std::vector<llama_tokens> & stop_seqs,
-        int32_t                           stop_count) {
-    return common_reasoning_budget_init_state(vocab, start_seqs, end_seqs, forced_tokens, budget, initial_state, stop_seqs, stop_count);
+        int32_t                           stop_count,
+        int32_t                           loop_window,
+        int32_t                           loop_max_unit) {
+    return common_reasoning_budget_init_state(vocab, start_seqs, end_seqs, forced_tokens, budget, initial_state, stop_seqs, stop_count, loop_window, loop_max_unit);
 }
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl) {

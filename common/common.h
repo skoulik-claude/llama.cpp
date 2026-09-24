@@ -294,6 +294,8 @@ struct common_params_sampling {
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
     std::vector<llama_tokens> reasoning_stop_seqs;             // stop sequences counted inside the reasoning block where they open a line
     int32_t                   reasoning_stop_count = 0;        // end the reasoning at this occurrence of a stop sequence, 0 = disabled
+    int32_t                   reasoning_loop_window = 0;       // end the reasoning once its tail repeats one unit over at least N tokens and 4 units, 0 = disabled
+    int32_t                   reasoning_loop_max_unit = 0;     // the longest unit tested, in tokens, 0 = reasoning_loop_window / 4
 
     bool backend_sampling = false;
 
