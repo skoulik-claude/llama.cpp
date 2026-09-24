@@ -292,6 +292,8 @@ struct common_params_sampling {
     std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+    std::vector<llama_tokens> reasoning_stop_seqs;             // stop sequences counted inside the reasoning block where they open a line
+    int32_t                   reasoning_stop_count = 0;        // end the reasoning at this occurrence of a stop sequence, 0 = disabled
 
     bool backend_sampling = false;
 

@@ -1323,6 +1323,10 @@ The `response_format` parameter supports both plain JSON output (e.g. `{"type": 
 
 `reasoning_control`: Arms realtime reasoning control for this completion so it can be ended early via `/v1/chat/completions/control`. Defaults to `false`.
 
+`reasoning_stop_words`: Strings to count inside the reasoning block, e.g. `["Wait"]`. An occurrence counts only where it opens a line: at the start of the reasoning, or right after a token ending with a newline. Each string is tokenized as given and matched as that token sequence, not as text: whether a longer word such as `Waiting` contains it depends on the vocabulary. Defaults to `[]`.
+
+`reasoning_stop_count`: End the reasoning at this occurrence of a `reasoning_stop_words` entry. The stop word is kept, then `reasoning_budget_message` and the end tag are forced, exactly as when the reasoning budget runs out; whichever comes first ends the reasoning. `0` disables it. Default: `0`
+
 `generation_prompt`: The generation prompt that was prefilled in by the template. Prepended to model output before parsing.
 
 `parse_tool_calls`: Whether to parse the generated tool call.
