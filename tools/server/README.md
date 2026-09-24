@@ -1327,6 +1327,10 @@ The `response_format` parameter supports both plain JSON output (e.g. `{"type": 
 
 `reasoning_stop_count`: End the reasoning at this occurrence of a `reasoning_stop_words` entry. The stop word is kept, then `reasoning_budget_message` and the end tag are forced, exactly as when the reasoning budget runs out; whichever comes first ends the reasoning. `0` disables it. Default: `0`
 
+`reasoning_loop_window`: End the reasoning once its tail is one unit repeated over at least N tokens and at least four whole units in a row — a model that keeps emitting the same token, phrase or paragraph. `reasoning_budget_message` and the end tag are then forced, as when the reasoning budget runs out, and the answer follows. Two or three copies of a sentence in a row never trigger it. `0` disables it. Default: `0`
+
+`reasoning_loop_max_unit`: The longest repeating unit `reasoning_loop_window` looks for, in tokens. A long unit needs four repeats before it counts, so a paragraph loop is cut later than a one-token loop. `0` uses a quarter of the window, where values below `4` test nothing. Default: `0`
+
 `generation_prompt`: The generation prompt that was prefilled in by the template. Prepended to model output before parsing.
 
 `parse_tool_calls`: Whether to parse the generated tool call.
