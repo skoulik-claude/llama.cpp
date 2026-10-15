@@ -511,6 +511,26 @@ task_params eval_llama_cmpl_schema(
     return params;
 }
 
+static void collect_field_names(const std::vector<std::unique_ptr<field>> & fields, const std::string & prefix, json & out) {
+    for (const auto & f : fields) {
+        for (const char * n : f->name) {
+            out.push_back(prefix + n);
+        }
+        if (const auto * nested = dynamic_cast<const field_nested *>(f.get())) {
+            collect_field_names(nested->subfields, prefix + f->name[0] + ".", out);
+        }
+    }
+}
+
+json llama_cmpl_schema_field_names(const common_params & params_base) {
+    // the schema is only built here, never evaluated, so the params it binds to are scratch
+    task_params params;
+    auto schema = make_llama_cmpl_schema(params_base, params);
+    json names = json::array();
+    collect_field_names(schema, "", names);
+    return names;
+}
+
 //
 // eval() implementations
 //
