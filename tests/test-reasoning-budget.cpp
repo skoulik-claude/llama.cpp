@@ -30,7 +30,9 @@ static void test_reasoning_budget(
     size_t expected_force_start,   // token index where forcing should start (SIZE_MAX = never)
     size_t expected_force_end,     // token index where forcing should end (after this, no more forcing)
     const std::vector<llama_tokens> & stop_seqs = {},
-    int32_t stop_count = 0
+    int32_t stop_count = 0,
+    int32_t loop_window = 0,
+    int32_t loop_max_unit = 0
 ) {
     // Find the maximum token ID to ensure our vocab covers all tokens
     llama_token max_token = 0;
@@ -57,7 +59,9 @@ static void test_reasoning_budget(
         budget,
         initial_state,
         stop_seqs,
-        stop_count
+        stop_count,
+        loop_window,
+        loop_max_unit
     );
 
     // Create a test token data array for checking forcing behavior
@@ -379,13 +383,7 @@ static void test_reasoning_stop_clone_and_reset() {
 
 // The line-start rule needs text, so it is tested on a real vocabulary: a stop word counts
 // only as the first token of the reasoning or right after a token ending with a newline.
-static void test_reasoning_stop_line_start(const char * vocab_path) {
-    llama_model_params mparams = llama_model_default_params();
-    mparams.vocab_only = true;
-    llama_model * model = llama_model_load_from_file(vocab_path, mparams);
-    GGML_ASSERT(model != nullptr && "failed to load the vocabulary");
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-
+static void test_reasoning_stop_line_start(const llama_vocab * vocab) {
     const llama_tokens start = common_tokenize(vocab, "<|channel>thought", false, true);
     const llama_tokens end   = common_tokenize(vocab, "<channel|>", false, true);
     const llama_tokens stop  = common_tokenize(vocab, "Wait", false, true);
@@ -428,9 +426,120 @@ static void test_reasoning_stop_line_start(const char * vocab_path) {
     // mid-line occurrences never count
     GGML_ASSERT(cut(mid_line, 1).empty());
 
-    llama_model_free(model);
-
     fprintf(stderr, "  Test 'stop words open a line' passed\n");
+}
+
+static void test_reasoning_loop_clone_and_reset() {
+    const std::vector<llama_tokens> start = {{100}};
+    const std::vector<llama_tokens> end   = {{101}};
+    const llama_tokens forced = {102, 101};
+
+    // window 8: a 1- or 2-token unit repeated over the last 8 tokens
+    auto * sampler = common_reasoning_budget_init(nullptr, start, end, forced, 100, REASONING_BUDGET_IDLE, {}, 0, 8);
+
+    llama_sampler_accept(sampler, 100); // COUNTING
+    for (int i = 0; i < 7; i++) {
+        llama_sampler_accept(sampler, 60);
+    }
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+
+    // a clone mid-run keeps the run
+    auto * clone = llama_sampler_clone(sampler);
+    llama_sampler_accept(clone, 60);    // the 8th
+    GGML_ASSERT(common_reasoning_budget_get_state(clone) == REASONING_BUDGET_FORCING && "cloned state lost the loop run");
+    GGML_ASSERT(get_forced_token(clone, 102) == 102);
+
+    // the original runs on its own: a different token breaks the run
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 60);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+
+    // reset() clears the history
+    llama_sampler_reset(sampler);
+    llama_sampler_accept(sampler, 100);
+    for (int i = 0; i < 7; i++) {
+        llama_sampler_accept(sampler, 60);
+    }
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING && "reset() must clear the loop run");
+
+    llama_sampler_free(clone);
+    llama_sampler_free(sampler);
+
+    fprintf(stderr, "  Test 'loop clone and reset' passed\n");
+}
+
+// The loops seen in practice, on a real vocabulary: Gemma 4 copying leader dots (its 16-dot
+// token over and over) and a 12-token phrase repeated. Both must be cut at window 64; a short
+// dot leader and a sentence written twice must not.
+static void test_reasoning_loop_real(const llama_vocab * vocab) {
+    const llama_tokens start = common_tokenize(vocab, "<|channel>thought", false, true);
+    const llama_tokens end   = common_tokenize(vocab, "<channel|>", false, true);
+
+    // the reasoning text accepted until the sampler starts forcing, or "" if it never does
+    const auto cut = [&](const std::string & thinking, int32_t max_unit = 0) {
+        auto * sampler = common_reasoning_budget_init(vocab, {start}, {end}, end, INT32_MAX, REASONING_BUDGET_IDLE, {}, 0, 64, max_unit);
+        for (const auto t : start) {
+            llama_sampler_accept(sampler, t);
+        }
+        std::string text;
+        bool forcing = false;
+        for (const auto t : common_tokenize(vocab, thinking, false, true)) {
+            llama_sampler_accept(sampler, t);
+            text += common_token_to_piece(vocab, t, false);
+            if (common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING) {
+                forcing = true;
+                break;
+            }
+        }
+        llama_sampler_free(sampler);
+        return forcing ? text : std::string();
+    };
+
+    const auto count = [](const std::string & text, const std::string & unit) {
+        size_t n = 0;
+        for (size_t pos = text.find(unit); pos != std::string::npos; pos = text.find(unit, pos + unit.size())) {
+            n++;
+        }
+        return n;
+    };
+
+    // leader dots: cut well before the 4,000 printed, once 64 tokens of them have repeated
+    const std::string lead = "\nThe row reads `Sk Managemen";
+    const std::string dots = cut(lead + std::string(4000, '.') + "`.");
+    GGML_ASSERT(!dots.empty() && "a run of dots must be cut");
+    GGML_ASSERT(dots.size() < lead.size() + 4000);
+    GGML_ASSERT(dots.size() >= lead.size() + 64 && "cut before the window filled");
+
+    // a repeated phrase: cut after four to six repeats
+    const std::string unit = " ... include their names, numbers, addresses and web addresses.";
+    std::string phrase = "\nIs it a company?";
+    for (int i = 0; i < 12; i++) {
+        phrase += unit;
+    }
+    const std::string looped = cut(phrase);
+    GGML_ASSERT(!looped.empty() && "a repeated phrase must be cut");
+    GGML_ASSERT(count(looped, unit) >= 4 && count(looped, unit) <= 6);
+
+    // a short dot leader and a sentence written twice are not loops
+    GGML_ASSERT(cut(lead + std::string(100, '.') + "` then 23 May, Online.").empty());
+    GGML_ASSERT(cut("\nCheck the list again. Check the list again. Then answer.").empty());
+
+    // a paragraph repeated verbatim is a unit far above a quarter of the window: cut only when
+    // the max unit allows it, and then at its 4th repeat
+    const std::string para =
+        "\n\nWait, \"EXAMPLE HOLDINGS PTY LTD\" is a company.\n\"EXAMPLE HOLDINGS PTY LTD AS "
+        "TRUSTEE FOR EXAMPLE TRUST\" is also a company.\nI'll include both.\n\nActually, I'll stick "
+        "to the most certain ones.\n- Example Bank\n- 12 345 678 901\n- 1 SAMPLE ST SYDNEY NSW 2000";
+    std::string paras = "\nFirst reading.";
+    for (int i = 0; i < 6; i++) {
+        paras += para;
+    }
+    GGML_ASSERT(cut(paras).empty() && "a unit above window/4 is not tested by default");
+    const std::string looped_para = cut(paras, 256);
+    GGML_ASSERT(!looped_para.empty() && "a paragraph loop must be cut when the max unit allows it");
+    GGML_ASSERT(count(looped_para, para) == 4);
+
+    fprintf(stderr, "  Test 'loops on a real vocabulary' passed\n");
 }
 
 // UTF-8 boundary detection unit test
@@ -699,22 +808,181 @@ int main(int argc, char ** argv) {
             {{60}}, 0);
     }
 
+    // Test 16: A one-token loop is cut once it fills the window
+    // Window 8 tests units of 1-2 tokens. Flow: i=2..9 the same token eight times; at i=9 the
+    // last 8 tokens are one token repeated -> FORCING; i=10..11 forced
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 50, 60, 60, 60, 60, 60, 60, 60, 60, 52, 53};
+
+        test_reasoning_budget("one-token loop", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            10,
+            11,
+            {}, 0, 8);
+    }
+
+    // Test 17: One repeat short of the window - no forcing
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 50, 60, 60, 60, 60, 60, 60, 60, 52, 53};
+
+        test_reasoning_budget("loop short of the window", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            SIZE_MAX, SIZE_MAX,
+            {}, 0, 8);
+    }
+
+    // Test 18: A two-token unit repeated four times fills the window
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 50, 60, 61, 60, 61, 60, 61, 60, 61, 52, 53};
+
+        test_reasoning_budget("two-token loop", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            10,
+            11,
+            {}, 0, 8);
+    }
+
+    // Test 19: A unit longer than a quarter of the window is never tested
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 50, 60, 61, 62, 60, 61, 62, 60, 61, 62, 60, 61, 62, 52};
+
+        test_reasoning_budget("unit above window/4", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            SIZE_MAX, SIZE_MAX,
+            {}, 0, 8);
+    }
+
+    // Test 20: Repeats outside the reasoning block are not counted
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {60, 60, 60, 60, 60, 60, 60, 60, 60, 100, 50, 101,
+                                                   60, 60, 60, 60, 60, 60, 60, 60, 60, 52};
+
+        test_reasoning_budget("loop outside reasoning not counted", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            SIZE_MAX, SIZE_MAX,
+            {}, 0, 8);
+    }
+
+    // Test 21: The history restarts when a new start tag re-arms the sampler
+    // Five repeats in each block: carried over, the second block would fill the window
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 60, 60, 60, 60, 60, 101,
+                                                   100, 60, 60, 60, 60, 60, 52};
+
+        test_reasoning_budget("loop history resets on re-arm", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            SIZE_MAX, SIZE_MAX,
+            {}, 0, 8);
+    }
+
+    // Test 22: A shorter budget still ends the reasoning first
+    // Flow: budget 5 runs out at the 5th repeat (i=5), three short of the window
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 60, 60, 60, 60, 60, 60, 60, 60, 52};
+
+        test_reasoning_budget("budget before loop", sequence, start, end, forced,
+            5,
+            REASONING_BUDGET_IDLE,
+            6,
+            7,
+            {}, 0, 8);
+    }
+
+    // Test 24: A longer unit, allowed by the max unit, is cut at its 4th whole repeat
+    // Window 8, units up to 4 tokens: {60,61,62} x4 = 12 tokens; at 3 repeats (9 tokens, more
+    // than the window) it must not fire yet. Flow: i=2..13 the units; i=13 completes the 4th
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 50, 60, 61, 62, 60, 61, 62, 60, 61, 62, 60, 61, 62, 52, 53};
+
+        test_reasoning_budget("long unit, four repeats", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            14,
+            15,
+            {}, 0, 8, 4);
+    }
+
+    // Test 25: ...and three repeats, filling the window, are not enough
+    {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 50, 60, 61, 62, 60, 61, 62, 60, 61, 62, 52, 53};
+
+        test_reasoning_budget("long unit, three repeats", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            SIZE_MAX, SIZE_MAX,
+            {}, 0, 8, 4);
+    }
+
+    // Test 23: A window of 0, or below 4, never cuts
+    for (const int32_t window : {0, 3}) {
+        const std::vector<llama_tokens> start = {{100}};
+        const std::vector<llama_tokens> end = {{101}};
+        const std::vector<llama_token> forced = {102, 101};
+        const std::vector<llama_token> sequence = {100, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 52};
+
+        test_reasoning_budget("loop window off", sequence, start, end, forced,
+            100,
+            REASONING_BUDGET_IDLE,
+            SIZE_MAX, SIZE_MAX,
+            {}, 0, window);
+    }
+
     test_reasoning_budget_clone_mid_counting();
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();
     test_reasoning_budget_end_match();
     test_reasoning_stop_clone_and_reset();
+    test_reasoning_loop_clone_and_reset();
 
-    printf("OK (20 tests passed)\n");
+    printf("OK (32 tests passed)\n");
 
     if (argc > 1) {
-        printf("Testing reasoning stop words on a real vocabulary... ");
+        printf("Testing reasoning stop words and loops on a real vocabulary... ");
         llama_backend_init();
-        test_reasoning_stop_line_start(argv[1]);
+        llama_model_params mparams = llama_model_default_params();
+        mparams.vocab_only = true;
+        llama_model * model = llama_model_load_from_file(argv[1], mparams);
+        GGML_ASSERT(model != nullptr && "failed to load the vocabulary");
+        test_reasoning_stop_line_start(llama_model_get_vocab(model));
+        test_reasoning_loop_real(llama_model_get_vocab(model));
+        llama_model_free(model);
         llama_backend_free();
         printf("OK\n");
     } else {
-        printf("Skipping the real-vocabulary stop word test (no vocabulary path given)\n");
+        printf("Skipping the real-vocabulary tests (no vocabulary path given)\n");
     }
 
     printf("Testing UTF-8 boundary detection... ");
