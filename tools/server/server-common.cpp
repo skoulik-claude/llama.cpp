@@ -1475,12 +1475,17 @@ json oaicompat_chat_params_parse(
     }
 
     // the session owns these, the server applies them with server_task::apply_chat_session()
-    for (const char * key : { "grammar_lazy", "grammar_triggers", "preserved_tokens" }) {
-        llama_params.erase(key);
-    }
+    llama_params.erase("preserved_tokens");
     if (!out_session.grammar().empty()) {
         llama_params.erase("grammar");
         llama_params.erase("json_schema");
+        // A template-produced grammar owns its lazy/trigger configuration too, so the
+        // request's own is dropped only alongside it. With no template grammar, a request
+        // that supplies a grammar together with its triggers keeps them: dropping them
+        // let the grammar apply from the first token, which a lazy grammar paired with a
+        // reasoning budget exists to avoid.
+        llama_params.erase("grammar_lazy");
+        llama_params.erase("grammar_triggers");
     }
 
     return llama_params;

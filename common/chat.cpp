@@ -1729,9 +1729,11 @@ void common_chat_session::apply_sampling(common_params_sampling & sampling) cons
         return;
     }
     if (!grammar_text.empty()) {
-        sampling.grammar = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, grammar_text};
+        sampling.grammar      = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, grammar_text};
+        // laziness belongs to whichever grammar applies: with no template grammar,
+        // keep the request's own setting rather than resetting it to false
+        sampling.grammar_lazy = grammar_lazy;
     }
-    sampling.grammar_lazy      = grammar_lazy;
     sampling.generation_prompt = generation_prompt_text;
     sampling.preserved_tokens.insert(preserved_tokens.begin(), preserved_tokens.end());
     sampling.grammar_triggers.insert(sampling.grammar_triggers.end(), grammar_triggers.begin(), grammar_triggers.end());
