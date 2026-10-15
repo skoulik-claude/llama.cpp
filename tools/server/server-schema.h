@@ -101,4 +101,8 @@ task_params eval_llama_cmpl_schema(
                     const std::vector<llama_logit_bias> & logit_bias_eog,
                     const json & data);
 
+// every field name a completion request may carry, aliases included and nested
+// fields as "parent.child" - published by GET /props as "request_fields"
+json llama_cmpl_schema_field_names(const common_params & params_base);
+
 } // namespace server_schema

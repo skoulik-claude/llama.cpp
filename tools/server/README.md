@@ -914,7 +914,8 @@ By default, it is read-only. To make POST request to change global properties, y
   },
   "media_marker": "<__media_YoNhud46VdDqbuFmKYEO9PY7A4ARzRfg__>",
   "build_info": "b(build number)-(build commit hash)",
-  "is_sleeping": false
+  "is_sleeping": false,
+  "request_fields": ["verbose", "timings_per_token", "stream", "stream_options", "stream_options.include_usage", "..."]
 }
 ```
 
@@ -925,6 +926,7 @@ By default, it is read-only. To make POST request to change global properties, y
 - `chat_template_caps` - capabilities of the chat template (see `common/jinja/caps.h` for more info)
 - `modalities` - the list of supported modalities
 - `is_sleeping` - sleeping status, see [Sleeping on idle](#sleeping-on-idle)
+- `request_fields` - every field name a completion request may carry (aliases included, nested fields as `parent.child`), so a client can tell whether this server understands a field before sending it; an unknown field is otherwise ignored silently
 
 ### POST `/props`: Change server global properties.
 
