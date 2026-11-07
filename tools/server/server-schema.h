@@ -109,4 +109,8 @@ void eval_tts_schema(
                     server_task & task,
                     const json & data);
 
+// every field name a completion request may carry, aliases included and nested
+// fields as "parent.child" - published by GET /props as "request_fields"
+json llama_cmpl_schema_field_names(const common_params & params_base);
+
 } // namespace server_schema
