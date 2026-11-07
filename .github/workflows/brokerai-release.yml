@@ -1,0 +1,116 @@
+name: BrokerAI release
+
+# The llama-server builds that BrokerAI's PII tool bundles: macOS arm64 (Metal) and
+# Windows x64 (CUDA), published as one GitHub release with SHA256SUMS. Runs on a
+# brokerai-* tag of brokerai-serving, or by hand (build only, no release).
+# Its own file rather than an edit to release.yml, so a rebase onto upstream never
+# conflicts with it.
+
+on:
+  push:
+    tags: ['brokerai-*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON"
+
+jobs:
+  macos-arm64:
+    runs-on: macos-26
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # the build number is the commit count
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release --target llama-server -j $(sysctl -n hw.logicalcpu)
+
+      - name: Pack
+        run: |
+          cp LICENSE build/bin/
+          tar -czf llama-server-${{ github.ref_name }}-macos-arm64.tar.gz -C build/bin .
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-arm64
+          path: llama-server-*-macos-arm64.tar.gz
+
+  windows-cuda:
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # CUDA 13 covers Turing (RTX 20) to Blackwell (RTX 50) and needs an R580 driver or newer;
+      # 12.4, the other version this action installs, stops before Blackwell.
+      - name: Install CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.4'
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=ON %CMAKE_ARGS%
+          cmake --build build --target llama-server -j %NUMBER_OF_PROCESSORS%
+
+      - name: Pack
+        run: |
+          Copy-Item LICENSE build\bin\
+          foreach ($d in 'bin', 'lib', 'bin\x64') {
+            robocopy "$env:CUDA_PATH\$d" build\bin cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+            if ($LASTEXITCODE -ge 8) { exit 1 }
+          }
+          7z a llama-server-${{ github.ref_name }}-win-cuda-13.4-x64.zip .\build\bin\*
+          exit 0
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: win-cuda-x64
+          path: llama-server-*-win-cuda-*-x64.zip
+
+  release:
+    needs: [macos-arm64, windows-cuda]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download
+        uses: actions/download-artifact@v7
+        with:
+          merge-multiple: true
+
+      - name: Checksums
+        run: sha256sum llama-server-* > SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" llama-server-* SHA256SUMS \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "llama-server built from brokerai-serving at ${{ github.sha }}."
