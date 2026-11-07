@@ -1221,7 +1221,9 @@ static bool op_filter_entry_matches(std::string_view entry, std::string_view op_
 // TODO: [TAG_MUL_MAT_ID_SKIP] see https://github.com/ggml-org/llama.cpp/pull/26631
 static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) {
     const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
-    if (strcmp(name, "CUDA") != 0 && strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0) {
+    // local/metal-mul-mv-id-no-skip: Metal's one-token kernel_mul_mv_id does not check for -1
+    if (strcmp(name, "CUDA") != 0 && strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0 &&
+        strcmp(name, "MTL") != 0) {
         return false;
     }
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
