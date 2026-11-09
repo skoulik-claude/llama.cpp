@@ -14,8 +14,16 @@ on:
 permissions:
   contents: write
 
+# Off, because BrokerAI's server needs none of them and each is a dependency or a capability:
+# - LLAMA_OPENSSL: left on, the server links whatever OpenSSL the runner has (Homebrew's on
+#   macOS) and will not start on a machine without that exact library. No HTTPS is needed:
+#   local model files, a private socket or loopback.
+# - LLAMA_USE_PREBUILT_UI: left on, the build downloads the web chat UI from Hugging Face and
+#   the server serves it. BrokerAI never uses it (and launches with --no-ui besides).
+# - LLAMA_SUBPROCESS: left on, the server can start other programs (the UI's MCP servers,
+#   router mode). A server that is handed classified pages has no need to.
 env:
-  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON"
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_OPENSSL=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_SUBPROCESS=OFF"
 
 jobs:
   macos-arm64:
